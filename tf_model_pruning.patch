@@ -1,0 +1,24 @@
+diff --git a/tensorflow/contrib/model_pruning/python/strip_pruning_vars_lib.py b/tensorflow/contrib/model_pruning/python/strip_pruning_vars_lib.py
+index fc4b10863f..2dd7413837 100644
+--- a/tensorflow/contrib/model_pruning/python/strip_pruning_vars_lib.py
++++ b/tensorflow/contrib/model_pruning/python/strip_pruning_vars_lib.py
+@@ -58,10 +58,18 @@ def _get_masked_weights(input_graph_def):
+ 
+     with session.Session(graph=input_graph) as sess:
+       masked_weights_dict = {}
++      feed_dict = {}
+       for node in input_graph_def.node:
++        if 'Placeholder' in node.op and 'shape' in node.attr:
++          shape_proto = node.attr['shape'].shape
++          input_shape = [
++            1 if dim.size == -1 else dim.size for dim in shape_proto.dim]
++          feed_dict.update({_tensor_name(node.name): np.zeros(input_shape)})
++          logging.info(f'Feeding {node.name} placeholder with dummy value\n')
+         if 'masked_weight' in node.name:
+           masked_weight_val = sess.run(
+-              sess.graph.get_tensor_by_name(_tensor_name(node.name)))
++              sess.graph.get_tensor_by_name(
++                _tensor_name(node.name)), feed_dict=feed_dict)
+           logging.info(
+               '%s has %d values, %1.2f%% zeros \n', node.name,
+               np.size(masked_weight_val),

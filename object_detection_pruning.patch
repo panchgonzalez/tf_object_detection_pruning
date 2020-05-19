@@ -1,0 +1,292 @@
+diff --git a/research/object_detection/model_main.py b/research/object_detection/model_main.py
+index 5e8db1e5..1d699eeb 100644
+--- a/research/object_detection/model_main.py
++++ b/research/object_detection/model_main.py
+@@ -24,6 +24,7 @@ import tensorflow as tf
+ 
+ from object_detection import model_hparams
+ from object_detection import model_lib
++from object_detection.hooks import train_hooks
+ 
+ flags.DEFINE_string(
+     'model_dir', None, 'Path to output model directory '
+@@ -41,6 +42,11 @@ flags.DEFINE_integer('sample_1_of_n_eval_on_train_examples', 5, 'Will sample '
+                      'one of every n train input examples for evaluation, '
+                      'where n is provided. This is only used if '
+                      '`eval_training_data` is True.')
++flags.DEFINE_integer(
++    "throttle_secs", 900, "Do not re-evaluate unless the last"
++    "evaluation was started at least this many seconds ago. "
++    "Of course, evaluation does not occur if no new "
++    "checkpoints are available, hence, this is the minimum")
+ flags.DEFINE_string(
+     'hparams_overrides', None, 'Hyperparameter overrides, '
+     'represented as a string containing comma-separated '
+@@ -53,6 +59,16 @@ flags.DEFINE_boolean(
+     'run_once', False, 'If running in eval-only mode, whether to run just '
+     'one round of eval vs running continuously (default).'
+ )
++flags.DEFINE_float(
++    "sparsity", None, "Desired sparsity to achieve during training. If sparsity"
++    "is None then model pruning will not take place"
++)
++flags.DEFINE_integer(
++    "pruning_start_step", None, "Step at which pruning will start"
++)
++flags.DEFINE_integer(
++    "pruning_end_step", None, "Step at which pruning will stop"
++)
+ FLAGS = flags.FLAGS
+ 
+ 
+@@ -93,13 +109,24 @@ def main(unused_argv):
+       model_lib.continuous_eval(estimator, FLAGS.checkpoint_dir, input_fn,
+                                 train_steps, name)
+   else:
++    if FLAGS.sparsity:
++        model_pruning_hook = train_hooks.ModelPruningHook(
++            target_sparsity=FLAGS.sparsity,
++            start_step=FLAGS.pruning_start_step,
++            end_step=FLAGS.pruning_end_step
++        )
++        hooks = [model_pruning_hook]
++    else:
++        hooks = None
+     train_spec, eval_specs = model_lib.create_train_and_eval_specs(
+         train_input_fn,
+         eval_input_fns,
+         eval_on_train_input_fn,
+         predict_input_fn,
+         train_steps,
+-        eval_on_train_data=False)
++        eval_on_train_data=False,
++        hooks=hooks,
++        throttle_secs=FLAGS.throttle_secs)
+ 
+     # Currently only a single Eval Spec is allowed.
+     tf.estimator.train_and_evaluate(estimator, train_spec, eval_specs[0])
+diff --git a/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py b/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py
+index 3152c7af..9be89057 100644
+--- a/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py
++++ b/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py
+@@ -25,6 +25,7 @@ from object_detection.meta_architectures import faster_rcnn_meta_arch
+ from nets import inception_v2
+ 
+ slim = contrib_slim
++model_pruning = tf.contrib.model_pruning
+ 
+ 
+ def _batch_norm_arg_scope(list_ops,
+@@ -253,3 +254,212 @@ class FasterRCNNInceptionV2FeatureExtractor(
+                 [branch_0, branch_1, branch_2, branch_3], concat_dim)
+ 
+     return proposal_classifier_features
++
++
++class FasterRCNNMaskedInceptionV2FeatureExtractor(
++    faster_rcnn_meta_arch.FasterRCNNFeatureExtractor):
++  """Faster R-CNN Masked Inception V2 feature extractor implementation.
++
++  This variant uses a masked version of InceptionV2 which contains both
++  auxiliary mask and threshold variables at each layer which will be used for
++  model sparsification during training.
++  """
++
++  def __init__(self,
++               is_training,
++               first_stage_features_stride,
++               batch_norm_trainable=False,
++               reuse_weights=None,
++               weight_decay=0.0,
++               depth_multiplier=1.0,
++               min_depth=16):
++    """Constructor.
++
++    Args:
++      is_training: See base class.
++      first_stage_features_stride: See base class.
++      batch_norm_trainable: See base class.
++      reuse_weights: See base class.
++      weight_decay: See base class.
++      depth_multiplier: float depth multiplier for feature extractor.
++      min_depth: minimum feature extractor depth.
++
++    Raises:
++      ValueError: If `first_stage_features_stride` is not 8 or 16.
++    """
++    if first_stage_features_stride != 8 and first_stage_features_stride != 16:
++      raise ValueError('`first_stage_features_stride` must be 8 or 16.')
++    self._depth_multiplier = depth_multiplier
++    self._min_depth = min_depth
++    super(FasterRCNNMaskedInceptionV2FeatureExtractor, self).__init__(
++        is_training, first_stage_features_stride, batch_norm_trainable,
++        reuse_weights, weight_decay)
++
++  def preprocess(self, resized_inputs):
++    """Faster R-CNN Inception V2 preprocessing.
++
++    Maps pixel values to the range [-1, 1].
++
++    Args:
++      resized_inputs: a [batch, height, width, channels] float tensor
++        representing a batch of images.
++
++    Returns:
++      preprocessed_inputs: a [batch, height, width, channels] float tensor
++        representing a batch of images.
++    """
++    return (2.0 / 255.0) * resized_inputs - 1.0
++
++  def _extract_proposal_features(self, preprocessed_inputs, scope):
++    """Extracts first stage RPN features.
++
++    Args:
++      preprocessed_inputs: A [batch, height, width, channels] float32 tensor
++        representing a batch of images.
++      scope: A scope name.
++
++    Returns:
++      rpn_feature_map: A tensor with shape [batch, height, width, depth]
++      activations: A dictionary mapping feature extractor tensor names to
++        tensors
++
++    Raises:
++      InvalidArgumentError: If the spatial size of `preprocessed_inputs`
++        (height or width) is less than 33.
++      ValueError: If the created network is missing the required activation.
++    """
++
++    preprocessed_inputs.get_shape().assert_has_rank(4)
++    shape_assert = tf.Assert(
++        tf.logical_and(tf.greater_equal(tf.shape(preprocessed_inputs)[1], 33),
++                       tf.greater_equal(tf.shape(preprocessed_inputs)[2], 33)),
++        ['image size must at least be 33 in both height and width.'])
++
++    with tf.control_dependencies([shape_assert]):
++      with tf.variable_scope('InceptionV2',
++                             reuse=self._reuse_weights) as scope:
++        with _batch_norm_arg_scope(
++          [model_pruning.masked_conv2d, slim.separable_conv2d],
++          batch_norm_scale=True, train_batch_norm=self._train_batch_norm):
++          _, activations = masked_inception_v2.masked_inception_v2_base(
++              preprocessed_inputs,
++              final_endpoint='Mixed_4e',
++              min_depth=self._min_depth,
++              depth_multiplier=self._depth_multiplier,
++              scope=scope)
++
++    return activations['Mixed_4e'], activations
++
++  def _extract_box_classifier_features(self, proposal_feature_maps, scope):
++    """Extracts second stage box classifier features.
++
++    Args:
++      proposal_feature_maps: A 4-D float tensor with shape
++        [batch_size * self.max_num_proposals, crop_height, crop_width, depth]
++        representing the feature map cropped to each proposal.
++      scope: A scope name (unused).
++
++    Returns:
++      proposal_classifier_features: A 4-D float tensor with shape
++        [batch_size * self.max_num_proposals, height, width, depth]
++        representing box classifier features for each proposal.
++    """
++    net = proposal_feature_maps
++
++    depth = lambda d: max(int(d * self._depth_multiplier), self._min_depth)
++    trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
++
++    data_format = 'NHWC'
++    concat_dim = 3 if data_format == 'NHWC' else 1
++
++    with tf.variable_scope('InceptionV2', reuse=self._reuse_weights):
++      with slim.arg_scope(
++          [model_pruning.masked_conv2d, slim.max_pool2d, slim.avg_pool2d],
++          stride=1,
++          padding='SAME',
++          data_format=data_format):
++        with _batch_norm_arg_scope(
++          [model_pruning.masked_conv2d, slim.separable_conv2d],
++          batch_norm_scale=True, train_batch_norm=self._train_batch_norm):
++
++          with tf.variable_scope('Mixed_5a'):
++            with tf.variable_scope('Branch_0'):
++              branch_0 = model_pruning.masked_conv2d(
++                  net, depth(128), [1, 1],
++                  weights_initializer=trunc_normal(0.09),
++                  scope='Conv2d_0a_1x1')
++              branch_0 = model_pruning.masked_conv2d(
++                branch_0, depth(192), [3, 3], stride=2, scope='Conv2d_1a_3x3')
++            with tf.variable_scope('Branch_1'):
++              branch_1 = model_pruning.masked_conv2d(
++                  net, depth(192), [1, 1],
++                  weights_initializer=trunc_normal(0.09),
++                  scope='Conv2d_0a_1x1')
++              branch_1 = model_pruning.masked_conv2d(
++                branch_1, depth(256), [3, 3], scope='Conv2d_0b_3x3')
++              branch_1 = model_pruning.masked_conv2d(
++                branch_1, depth(256), [3, 3], stride=2, scope='Conv2d_1a_3x3')
++            with tf.variable_scope('Branch_2'):
++              branch_2 = slim.max_pool2d(net, [3, 3], stride=2,
++                                         scope='MaxPool_1a_3x3')
++            net = tf.concat([branch_0, branch_1, branch_2], concat_dim)
++
++          with tf.variable_scope('Mixed_5b'):
++            with tf.variable_scope('Branch_0'):
++              branch_0 = model_pruning.masked_conv2d(
++                net, depth(352), [1, 1], scope='Conv2d_0a_1x1')
++            with tf.variable_scope('Branch_1'):
++              branch_1 = model_pruning.masked_conv2d(
++                  net, depth(192), [1, 1],
++                  weights_initializer=trunc_normal(0.09),
++                  scope='Conv2d_0a_1x1')
++              branch_1 = model_pruning.masked_conv2d(
++                branch_1, depth(320), [3, 3], scope='Conv2d_0b_3x3')
++            with tf.variable_scope('Branch_2'):
++              branch_2 = model_pruning.masked_conv2d(
++                  net, depth(160), [1, 1],
++                  weights_initializer=trunc_normal(0.09),
++                  scope='Conv2d_0a_1x1')
++              branch_2 = model_pruning.masked_conv2d(
++                branch_2, depth(224), [3, 3], scope='Conv2d_0b_3x3')
++              branch_2 = model_pruning.masked_conv2d(
++                branch_2, depth(224), [3, 3], scope='Conv2d_0c_3x3')
++            with tf.variable_scope('Branch_3'):
++              branch_3 = slim.avg_pool2d(net, [3, 3], scope='AvgPool_0a_3x3')
++              branch_3 = model_pruning.masked_conv2d(
++                  branch_3, depth(128), [1, 1],
++                  weights_initializer=trunc_normal(0.1),
++                  scope='Conv2d_0b_1x1')
++            net = tf.concat([branch_0, branch_1, branch_2, branch_3],
++                            concat_dim)
++
++          with tf.variable_scope('Mixed_5c'):
++            with tf.variable_scope('Branch_0'):
++              branch_0 = model_pruning.masked_conv2d(
++                net, depth(352), [1, 1], scope='Conv2d_0a_1x1')
++            with tf.variable_scope('Branch_1'):
++              branch_1 = model_pruning.masked_conv2d(
++                  net, depth(192), [1, 1],
++                  weights_initializer=trunc_normal(0.09),
++                  scope='Conv2d_0a_1x1')
++              branch_1 = model_pruning.masked_conv2d(
++                branch_1, depth(320), [3, 3], scope='Conv2d_0b_3x3')
++            with tf.variable_scope('Branch_2'):
++              branch_2 = model_pruning.masked_conv2d(
++                  net, depth(192), [1, 1],
++                  weights_initializer=trunc_normal(0.09),
++                  scope='Conv2d_0a_1x1')
++              branch_2 = model_pruning.masked_conv2d(
++                branch_2, depth(224), [3, 3], scope='Conv2d_0b_3x3')
++              branch_2 = model_pruning.masked_conv2d(
++                branch_2, depth(224), [3, 3], scope='Conv2d_0c_3x3')
++            with tf.variable_scope('Branch_3'):
++              branch_3 = slim.max_pool2d(net, [3, 3], scope='MaxPool_0a_3x3')
++              branch_3 = model_pruning.masked_conv2d(
++                  branch_3, depth(128), [1, 1],
++                  weights_initializer=trunc_normal(0.1),
++                  scope='Conv2d_0b_1x1')
++            proposal_classifier_features = tf.concat(
++                [branch_0, branch_1, branch_2, branch_3], concat_dim)
++
++    return proposal_classifier_features
