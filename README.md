@@ -1,11 +1,15 @@
-# Pruning Mask R-CNN Models with TensorFlow
+# Pruning Object Detection Models with TensorFlow
 
+At the moment there is no official model pruning support for TensorFlow's 1.x Object Detection
+API. This repo attempts to solve this issue. A base example is setup for the InceptionV2-based
+FasterRCNN models.
 
 ## Setup
 
 Clone repo with submodules
 ```bash
 git clone --recurse-submodules git@github.com:panchgonzalez/tf_object_detection_pruning.git
+cd tf_object_detection_pruning
 ```
 
 Apply patch to `tensorflow.contrib.model_pruning` library and compile
@@ -50,6 +54,28 @@ python setup.py install
 cp -r pycocotools ../models/research
 ```
 
+## Train with Model Pruning
+
+To train with model pruning turned on pass the following flags to `model_main.py`
+
+- `--sparsity`: target sparsity level
+- `--pruning_start_step`: start pruning at this training step
+- `--pruning_start_step`: stop pruning at this training step
+
+
+```bash
+python ${OBJECT_DETECTION_PATH}/object_detection/model_main.py \
+    --pipeline_config_path=${PIPELINE_CONFIG_PATH} \
+    --model_dir=${MODEL_DIR} \
+    --sample_1_of_n_eval_examples=$SAMPLE_1_OF_N_EVAL_EXAMPLES \
+    --alsologtostderrcd ../ \
+    --throttle_secs=2100 \
+    --sparsity=0.85 \
+    --pruning_start_step=100000 \
+    --pruning_end_step=200000
+```
+
+![](_docs/pruning_decay.png)
 
 ## References
 
