@@ -4,6 +4,8 @@ At the moment there is no official model pruning support for TensorFlow's 1.x Ob
 API. This repo attempts to solve this issue. A base example is setup for the InceptionV2-based
 FasterRCNN models.
 
+This repo contains the full code for the blog post: [Pruning Mask RCNN Models with TensorFlow](https://panch.io/articles/2020-05/pruning-mask-rcnn-models-with-tensorflow)
+
 ## Setup
 
 Clone repo with submodules
