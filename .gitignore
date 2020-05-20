@@ -1,4 +1,3 @@
-# Ignore changes in submodules
-cocoapi/
-models/
 tensorflow/
+models/
+cocoapi/
