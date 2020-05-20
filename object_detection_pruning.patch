@@ -1,5 +1,103 @@
+diff --git a/research/object_detection/hooks/__init__.py b/research/object_detection/hooks/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/research/object_detection/hooks/train_hooks.py b/research/object_detection/hooks/train_hooks.py
+new file mode 100644
+index 00000000..7c9ee4d2
+--- /dev/null
++++ b/research/object_detection/hooks/train_hooks.py
+@@ -0,0 +1,89 @@
++"""Hooks used during training."""
++
++import tensorflow as tf
++
++model_pruning = tf.contrib.model_pruning
++
++
++class ModelPruningHook(tf.train.SessionRunHook):
++  """Updates model pruning masks and thresholds during training."""
++
++  def __init__(self, target_sparsity, start_step, end_step):
++    """Initializes a `ModelPruningHook`.
++
++    This hooks updates masks to a specified sparsity over a certain number of
++    training steps.
++
++    Args:
++      target_sparsity: float between 0 and 1 with desired sparsity
++      start_step: int step to start pruning
++      end_step: int step to end pruning
++    """
++    tf.logging.info("Create ModelPruningHook.")
++    self.pruning_hparams = self._get_pruning_hparams(
++      target_sparsity=target_sparsity,
++      start_step=start_step,
++      end_step=end_step
++    )
++
++  def begin(self):
++    """Called once before using the session.
++    When called, the default graph is the one that will be launched in the
++    session.  The hook can modify the graph by adding new operations to it.
++    After the `begin()` call the graph will be finalized and the other callbacks
++    can not modify the graph anymore. Second call of `begin()` on the same
++    graph, should not change the graph.
++    """
++    self.global_step_tensor = tf.train.get_global_step()
++    self.mask_update_op = self._get_mask_update_op()
++
++  def after_run(self, run_context, run_values):
++    """Called after each call to run().
++    The `run_values` argument contains results of requested ops/tensors by
++    `before_run()`.
++    The `run_context` argument is the same one send to `before_run` call.
++    `run_context.request_stop()` can be called to stop the iteration.
++    If `session.run()` raises any exceptions then `after_run()` is not called.
++    Args:
++      run_context: A `SessionRunContext` object.
++      run_values: A SessionRunValues object.
++    """
++    run_context.session.run(self.mask_update_op)
++
++  def _get_mask_update_op(self):
++    """Fetches model pruning mask update op."""
++    graph = tf.get_default_graph()
++    with graph.as_default():
++      pruning = model_pruning.Pruning(
++        self.pruning_hparams,
++        global_step=self.global_step_tensor
++      )
++      mask_update_op = pruning.conditional_mask_update_op()
++      pruning.add_pruning_summaries()
++      return mask_update_op
++
++  def _get_pruning_hparams(self,
++                           target_sparsity=0.5,
++                           start_step=0,
++                           end_step=-1):
++    """Get pruning hyperparameters with updated values.
++
++    Args:
++      target_sparsity: float between 0 and 1 with desired sparsity
++      start_step: int step to start pruning
++      end_step: int step to end pruning
++    """
++    pruning_hparams = model_pruning.get_pruning_hparams()
++
++    # Set the target sparsity
++    pruning_hparams.target_sparsity = target_sparsity
++
++    # Set begin pruning step
++    pruning_hparams.begin_pruning_step = start_step
++    pruning_hparams.sparsity_function_begin_step = start_step
++
++    # Set final pruning step
++    pruning_hparams.end_pruning_step = end_step
++    pruning_hparams.sparsity_function_end_step = end_step
++
++    return pruning_hparams
 diff --git a/research/object_detection/model_main.py b/research/object_detection/model_main.py
-index 5e8db1e5..1d699eeb 100644
+index 5e8db1e5..1cab113e 100644
 --- a/research/object_detection/model_main.py
 +++ b/research/object_detection/model_main.py
 @@ -24,6 +24,7 @@ import tensorflow as tf
@@ -22,10 +120,14 @@ index 5e8db1e5..1d699eeb 100644
  flags.DEFINE_string(
      'hparams_overrides', None, 'Hyperparameter overrides, '
      'represented as a string containing comma-separated '
-@@ -53,6 +59,16 @@ flags.DEFINE_boolean(
+@@ -53,6 +59,20 @@ flags.DEFINE_boolean(
      'run_once', False, 'If running in eval-only mode, whether to run just '
      'one round of eval vs running continuously (default).'
  )
++flags.DEFINE_boolean(
++    "load_pretrained", True, "If loading pretrained model, otherwise"
++    "initialize weights randomly"
++)
 +flags.DEFINE_float(
 +    "sparsity", None, "Desired sparsity to achieve during training. If sparsity"
 +    "is None then model pruning will not take place"
@@ -39,7 +141,17 @@ index 5e8db1e5..1d699eeb 100644
  FLAGS = flags.FLAGS
 
 
-@@ -93,13 +109,24 @@ def main(unused_argv):
+@@ -63,7 +83,8 @@ def main(unused_argv):
+
+   train_and_eval_dict = model_lib.create_estimator_and_inputs(
+       run_config=config,
+-      hparams=model_hparams.create_hparams(FLAGS.hparams_overrides),
++      hparams=model_hparams.create_hparams(
++        FLAGS.load_pretrained, FLAGS.hparams_overrides),
+       pipeline_config_path=FLAGS.pipeline_config_path,
+       train_steps=FLAGS.num_train_steps,
+       sample_1_of_n_eval_examples=FLAGS.sample_1_of_n_eval_examples,
+@@ -93,13 +114,24 @@ def main(unused_argv):
        model_lib.continuous_eval(estimator, FLAGS.checkpoint_dir, input_fn,
                                  train_steps, name)
    else:
@@ -66,13 +178,21 @@ index 5e8db1e5..1d699eeb 100644
      # Currently only a single Eval Spec is allowed.
      tf.estimator.train_and_evaluate(estimator, train_spec, eval_specs[0])
 diff --git a/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py b/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py
-index 3152c7af..9be89057 100644
+index 3152c7af..d04aa3df 100644
 --- a/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py
 +++ b/research/object_detection/models/faster_rcnn_inception_v2_feature_extractor.py
-@@ -25,6 +25,7 @@ from object_detection.meta_architectures import faster_rcnn_meta_arch
- from nets import inception_v2
+@@ -19,12 +19,13 @@ See "Rethinking the Inception Architecture for Computer Vision"
+ https://arxiv.org/abs/1512.00567
+ """
+ import tensorflow as tf
+-from tensorflow.contrib import slim as contrib_slim
 
- slim = contrib_slim
+ from object_detection.meta_architectures import faster_rcnn_meta_arch
+ from nets import inception_v2
++from nets import masked_inception_v2
+
+-slim = contrib_slim
++slim = tf.contrib.slim
 +model_pruning = tf.contrib.model_pruning
 
 
@@ -290,6 +410,112 @@ index 3152c7af..9be89057 100644
 +                [branch_0, branch_1, branch_2, branch_3], concat_dim)
 +
 +    return proposal_classifier_features
+diff --git a/research/slim/nets/inception.py b/research/slim/nets/inception.py
+index b69cd2aa..2a9eb369 100644
+--- a/research/slim/nets/inception.py
++++ b/research/slim/nets/inception.py
+@@ -34,4 +34,10 @@ from nets.inception_v3 import inception_v3_base
+ from nets.inception_v4 import inception_v4
+ from nets.inception_v4 import inception_v4_arg_scope
+ from nets.inception_v4 import inception_v4_base
++
++# Masked inception models
++from nets.masked_inception_v2 import masked_inception_v2
++from nets.masked_inception_v2 import masked_inception_v2_base
++from nets.masked_inception_v2 import masked_inception_v2_arg_scope
++
+ # pylint: enable=unused-import
+diff --git a/research/slim/nets/inception_utils.py b/research/slim/nets/inception_utils.py
+index 493a684c..7f19c64c 100644
+--- a/research/slim/nets/inception_utils.py
++++ b/research/slim/nets/inception_utils.py
+@@ -25,19 +25,18 @@ from __future__ import division
+ from __future__ import print_function
+
+ import tensorflow as tf
+-from tensorflow.contrib import slim as contrib_slim
+
+-slim = contrib_slim
++slim = tf.contrib.slim
++model_pruning = tf.contrib.model_pruning
+
+
+-def inception_arg_scope(
+-    weight_decay=0.00004,
+-    use_batch_norm=True,
+-    batch_norm_decay=0.9997,
+-    batch_norm_epsilon=0.001,
+-    activation_fn=tf.nn.relu,
+-    batch_norm_updates_collections=tf.compat.v1.GraphKeys.UPDATE_OPS,
+-    batch_norm_scale=False):
++def inception_arg_scope(weight_decay=0.00004,
++                        use_batch_norm=True,
++                        batch_norm_decay=0.9997,
++                        batch_norm_epsilon=0.001,
++                        activation_fn=tf.nn.relu,
++                        batch_norm_updates_collections=tf.GraphKeys.UPDATE_OPS,
++                        batch_norm_scale=False):
+   """Defines the default arg scope for inception models.
+
+   Args:
+@@ -82,3 +81,57 @@ def inception_arg_scope(
+         normalizer_fn=normalizer_fn,
+         normalizer_params=normalizer_params) as sc:
+       return sc
++
++
++def masked_inception_arg_scope(weight_decay=0.00004,
++                               use_batch_norm=True,
++                               batch_norm_decay=0.9997,
++                               batch_norm_epsilon=0.001,
++                               activation_fn=tf.nn.relu,
++                               batch_norm_updates_collections=tf.GraphKeys.UPDATE_OPS,
++                               batch_norm_scale=False):
++  """Defines the default arg scope for masked inception models.
++
++  Args:
++    weight_decay: The weight decay to use for regularizing the model.
++    use_batch_norm: "If `True`, batch_norm is applied after each convolution.
++    batch_norm_decay: Decay for batch norm moving average.
++    batch_norm_epsilon: Small float added to variance to avoid dividing by zero
++      in batch norm.
++    activation_fn: Activation function for conv2d.
++    batch_norm_updates_collections: Collection for the update ops for
++      batch norm.
++    batch_norm_scale: If True, uses an explicit `gamma` multiplier to scale the
++      activations in the batch normalization layer.
++
++  Returns:
++    An `arg_scope` to use for the inception models.
++  """
++  batch_norm_params = {
++      # Decay for the moving averages.
++      'decay': batch_norm_decay,
++      # epsilon to prevent 0s in variance.
++      'epsilon': batch_norm_epsilon,
++      # collection containing update_ops.
++      'updates_collections': batch_norm_updates_collections,
++      # use fused batch norm if possible.
++      'fused': None,
++      'scale': batch_norm_scale,
++  }
++  if use_batch_norm:
++    normalizer_fn = slim.batch_norm
++    normalizer_params = batch_norm_params
++  else:
++    normalizer_fn = None
++    normalizer_params = {}
++  # Set weight_decay for weights in Conv and FC layers.
++  with slim.arg_scope(
++    [model_pruning.masked_conv2d, model_pruning.masked_fully_connected],
++    weights_regularizer=slim.l2_regularizer(weight_decay)):
++    with slim.arg_scope(
++        [model_pruning.masked_conv2d],
++        weights_initializer=slim.variance_scaling_initializer(),
++        activation_fn=activation_fn,
++        normalizer_fn=normalizer_fn,
++        normalizer_params=normalizer_params) as sc:
++      return sc
 diff --git a/research/slim/nets/masked_inception_v2.py b/research/slim/nets/masked_inception_v2.py
 new file mode 100644
 index 00000000..ae2e7cdf
@@ -1294,73 +1520,3 @@ index 00000000..00e274ed
 +
 +if __name__ == '__main__':
 +  tf.test.main()
-diff --git a/research/slim/nets/inception_utils.py b/research/slim/nets/inception_utils.py
-index 493a684c..1471203b 100644
---- a/research/slim/nets/inception_utils.py
-+++ b/research/slim/nets/inception_utils.py
-@@ -28,7 +28,7 @@ import tensorflow as tf
- from tensorflow.contrib import slim as contrib_slim
-
- slim = contrib_slim
--
-+model_pruning = tf.contrib.model_pruning
-
- def inception_arg_scope(
-     weight_decay=0.00004,
-@@ -82,3 +82,56 @@ def inception_arg_scope(
-         normalizer_fn=normalizer_fn,
-         normalizer_params=normalizer_params) as sc:
-       return sc
-+
-+def masked_inception_arg_scope(weight_decay=0.00004,
-+                               use_batch_norm=True,
-+                               batch_norm_decay=0.9997,
-+                               batch_norm_epsilon=0.001,
-+                               activation_fn=tf.nn.relu,
-+                               batch_norm_updates_collections=tf.GraphKeys.UPDATE_OPS,
-+                               batch_norm_scale=False):
-+  """Defines the default arg scope for masked inception models.
-+
-+  Args:
-+    weight_decay: The weight decay to use for regularizing the model.
-+    use_batch_norm: "If `True`, batch_norm is applied after each convolution.
-+    batch_norm_decay: Decay for batch norm moving average.
-+    batch_norm_epsilon: Small float added to variance to avoid dividing by zero
-+      in batch norm.
-+    activation_fn: Activation function for conv2d.
-+    batch_norm_updates_collections: Collection for the update ops for
-+      batch norm.
-+    batch_norm_scale: If True, uses an explicit `gamma` multiplier to scale the
-+      activations in the batch normalization layer.
-+
-+  Returns:
-+    An `arg_scope` to use for the inception models.
-+  """
-+  batch_norm_params = {
-+      # Decay for the moving averages.
-+      'decay': batch_norm_decay,
-+      # epsilon to prevent 0s in variance.
-+      'epsilon': batch_norm_epsilon,
-+      # collection containing update_ops.
-+      'updates_collections': batch_norm_updates_collections,
-+      # use fused batch norm if possible.
-+      'fused': None,
-+      'scale': batch_norm_scale,
-+  }
-+  if use_batch_norm:
-+    normalizer_fn = slim.batch_norm
-+    normalizer_params = batch_norm_params
-+  else:
-+    normalizer_fn = None
-+    normalizer_params = {}
-+  # Set weight_decay for weights in Conv and FC layers.
-+  with slim.arg_scope(
-+    [model_pruning.masked_conv2d, model_pruning.masked_fully_connected],
-+    weights_regularizer=slim.l2_regularizer(weight_decay)):
-+    with slim.arg_scope(
-+        [model_pruning.masked_conv2d],
-+        weights_initializer=slim.variance_scaling_initializer(),
-+        activation_fn=activation_fn,
-+        normalizer_fn=normalizer_fn,
-+        normalizer_params=normalizer_params) as sc:
-+      return sc
