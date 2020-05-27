@@ -6,6 +6,8 @@ FasterRCNN models.
 
 This repo contains the full code for the blog post: [Pruning Mask RCNN Models with TensorFlow](https://panch.io/articles/2020-05/pruning-mask-rcnn-models-with-tensorflow)
 
+![](_docs/pruning_decay.png)
+
 ## Setup
 
 Clone repo with submodules
@@ -77,7 +79,17 @@ python ${OBJECT_DETECTION_PATH}/object_detection/model_main.py \
     --pruning_end_step=200000
 ```
 
-![](_docs/pruning_decay.png)
+During training you can check the overall sparsity in tensorboard
+
+![](_docs/model_pruning_test.png)
+
+## Known issues:
+
+It seems that training with TF 1.15 returns the following runtime error
+```
+RuntimeError: Init operations did not make model ready for local_init. Init op: group_deps, init fn: None, error: Variables not initialized: model_pruning/last_mask_update_step
+```
+This is fixed by downgrading to TF 1.14. Thanks to [@anshkumar](https://github.com/anshkumar) for pointing this out.
 
 ## References
 
